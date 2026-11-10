@@ -26,7 +26,9 @@ def make_png(payload=b"PNG-image-data"):
 
 
 def make_gif(payload=b"GIF-image-data"):
-    return b"GIF89a" + payload + b"\x3b"
+    # Structurally valid minimal GIF: header + payload + the zero-length
+    # sub-block terminator (00) before the trailer byte (3B).
+    return b"GIF89a" + payload + b"\x00\x3b"
 
 
 def make_pdf(payload=b"PDF-document-data"):
@@ -143,10 +145,50 @@ class TestScanBytes(unittest.TestCase):
         self.assertEqual(result.files[0].size, len(blob))
 
     def test_gif87a_header(self):
-        blob = b"GIF87a" + b"old-gif-data" + b"\x3b"
+        blob = b"GIF87a" + b"old-gif-data" + b"\x00\x3b"
         result = scan_bytes(blob)
         self.assertEqual(len(result.files), 1)
         self.assertEqual(result.files[0].file_type, "gif")
+
+    def test_gif_3b_inside_image_data_does_not_cut(self):
+        # Regression (audit 2026-11-10): a bare 0x3B byte used to end the
+        # file, so any real GIF — LZW data contains 0x3B constantly —
+        # carved far too short. Only 00 3B (terminator + trailer) ends it.
+        blob = b"GIF89a" + bytes(range(256)) * 4 + b"\x00\x3b"
+        result = scan_bytes(blob)
+        self.assertEqual(len(result.files), 1)
+        self.assertEqual(result.files[0].size, len(blob))
+        self.assertEqual(result.files[0].status, "complete")
+
+    def test_zip_max_size_cap_is_never_exceeded(self):
+        # Regression (audit 2026-11-10): the ZIP comment length used to
+        # push the carved end past --max-size, and the file was still
+        # reported complete.
+        local = b"PK\x03\x04" + b"A" * 2
+        eocd = b"PK\x05\x06" + struct.pack("<HHHHIIH", 0, 0, 1, 1, 0, 0, 100)
+        blob = local + eocd + b"C" * 100
+        result = scan_bytes(blob, max_size=20)
+        self.assertEqual(len(result.files), 1)
+        self.assertEqual(result.files[0].size, 20)
+        self.assertEqual(result.files[0].status, "truncated")
+
+    def test_zip_comment_cut_at_eof_is_truncated(self):
+        # Regression (audit 2026-11-10): a ZIP whose EOCD comment claims
+        # 100 bytes but only has 10 before EOF was reported complete.
+        local = b"PK\x03\x04" + b"A" * 2
+        eocd = b"PK\x05\x06" + struct.pack("<HHHHIIH", 0, 0, 1, 1, 0, 0, 100)
+        blob = local + eocd + b"C" * 10
+        result = scan_bytes(blob)
+        self.assertEqual(len(result.files), 1)
+        self.assertEqual(result.files[0].size, len(blob))
+        self.assertEqual(result.files[0].status, "truncated")
+
+    def test_png_iend_without_crc_is_truncated(self):
+        blob = (b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\x0dIHDR" + b"P" * 4
+                + b"\x00\x00\x00\x00IEND")
+        result = scan_bytes(blob)
+        self.assertEqual(len(result.files), 1)
+        self.assertEqual(result.files[0].status, "truncated")
 
 
 class TestScanFileAndCarve(unittest.TestCase):
@@ -259,7 +301,39 @@ class TestCLI(unittest.TestCase):
     def test_version_flag(self):
         proc = self.run_cli("--version")
         self.assertEqual(proc.returncode, 0)
-        self.assertIn("llimbo 1.0.0", proc.stdout)
+        self.assertIn("llimbo 1.0.1", proc.stdout)
+
+    def test_prefix_with_separator_is_rejected(self):
+        # Regression (audit 2026-11-10): --prefix "../escape" used to
+        # write the recovered file outside --out-dir.
+        out = os.path.join(self.tmp.name, "out")
+        proc = self.run_cli("scan", self.image, "-o", out,
+                            "--prefix", "../escape", "--quiet")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("prefix", proc.stderr)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.tmp.name, "escape-0001.jpg")))
+
+    def test_out_dir_is_a_file_reports_clean_error(self):
+        # Regression (audit 2026-11-10): the failure used to be reported
+        # as "cannot read <image>: File exists".
+        block = os.path.join(self.tmp.name, "afile")
+        with open(block, "w") as fh:
+            fh.write("x")
+        proc = self.run_cli("scan", self.image, "-o", block, "--quiet")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("cannot create", proc.stderr)
+        self.assertIn("afile", proc.stderr)
+
+    def test_empty_types_is_rejected(self):
+        # Regression (audit 2026-11-10): --types "" silently scanned
+        # everything, --types " , " silently scanned nothing (exit 10).
+        out = os.path.join(self.tmp.name, "out")
+        for bad in ("", " , "):
+            proc = self.run_cli("scan", self.image, "-o", out,
+                                "--types", bad, "--quiet")
+            self.assertEqual(proc.returncode, 2, bad)
+            self.assertIn("at least one type", proc.stderr)
 
 
 if __name__ == "__main__":

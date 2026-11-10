@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 from . import __version__
@@ -93,14 +94,25 @@ def _report(result, written: list[str], image: str) -> dict:
 
 def cmd_scan(args: argparse.Namespace) -> int:
     types = None
-    if args.types:
+    if args.types is not None:
         types = tuple(t.strip().lower() for t in args.types.split(",") if t.strip())
+        if not types:
+            print("llimbo: --types must name at least one type",
+                  file=sys.stderr)
+            print(f"llimbo: known types: {_TYPE_NAMES}", file=sys.stderr)
+            return EXIT_ERROR
         unknown = sorted(set(types) - {t.name for t in SIGNATURES})
         if unknown:
             print(f"llimbo: unknown file type(s): {', '.join(unknown)}",
                   file=sys.stderr)
             print(f"llimbo: known types: {_TYPE_NAMES}", file=sys.stderr)
             return EXIT_ERROR
+    try:
+        os.makedirs(args.out_dir, exist_ok=True)
+    except OSError as exc:
+        print(f"llimbo: cannot create {args.out_dir}: "
+              f"{exc.strerror or exc}", file=sys.stderr)
+        return EXIT_ERROR
     try:
         result, written = carve(
             args.image,
@@ -110,6 +122,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
             max_size=args.max_size,
             prefix=args.prefix,
         )
+    except ValueError as exc:
+        print(f"llimbo: {exc}", file=sys.stderr)
+        return EXIT_ERROR
     except FileNotFoundError:
         print(f"llimbo: no such file: {args.image}", file=sys.stderr)
         return EXIT_ERROR

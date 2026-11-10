@@ -12,7 +12,7 @@ Standard library only. No dependencies.
 | --- | --- | --- | --- |
 | JPEG | `FF D8 FF` | `FF D9` | First footer wins (see Limitations) |
 | PNG | `89 50 4E 47 0D 0A 1A 0A` | `IEND` + CRC | CRC bytes are kept |
-| GIF | `GIF87a` / `GIF89a` | `3B` trailer | Trailer detection is heuristic |
+| GIF | `GIF87a` / `GIF89a` | `00 3B` (terminator + trailer) | Trailer detection is heuristic |
 | PDF | `%PDF-` | `%%EOF` | |
 | ZIP | `PK 03 04` | End-of-central-directory record | Archive comment is kept |
 
@@ -45,7 +45,7 @@ llimbo scan <image> -o <out-dir> [options]
 | `--types` | all | Comma-separated subset, e.g. `jpeg,png` |
 | `--min-size SIZE` | 0 | Ignore carved blobs smaller than SIZE |
 | `--max-size SIZE` | none | Cap one carved file at SIZE; cut files are `truncated` |
-| `--prefix` | `recovered` | Output filename prefix |
+| `--prefix` | `recovered` | Output filename prefix (a plain filename, no `/` or `\`) |
 | `--json FILE` | — | Write the recovery report as JSON |
 | `--quiet` | off | Print only the summary line |
 
@@ -90,10 +90,14 @@ SHA-256 — enough to verify a recovery without re-scanning the image.
 
 - **First footer wins.** A JPEG containing an embedded thumbnail is cut at
   the thumbnail's `FF D9`, not the outer image's. The carved prefix is still
-  a valid (if cropped) image.
-- **GIF trailer is a single byte.** The first `3B` after the header ends the
-  file, so a GIF whose image data happens to contain `3B` early is cut short.
-  The other four types use multi-byte footers and do not have this problem.
+  a valid (if cropped) image. The same applies to the other types: a `PK 05 06`
+  or `IEND` byte pattern inside a ZIP's compressed data or a PNG's image data
+  cuts that file short.
+- **GIF trailer is heuristic.** The trailer is the two-byte pair `00 3B`
+  (zero-length sub-block terminator + trailer byte), which a valid GIF
+  always ends with — but that pair can also occur inside compressed image
+  data, cutting the file short. A bare `3B` is *not* used as a footer: it
+  appears inside LZW data so often that it truncated nearly every real GIF.
 - **No validation of content.** A carved file has the right magic bytes and
   footer, but llimbo does not decode the payload — a corrupted interior still
   carves as `complete`. Check recovered files with a viewer or decoder.
@@ -109,6 +113,6 @@ SHA-256 — enough to verify a recovery without re-scanning the image.
 python -m unittest discover -s tests
 ```
 
-23 tests, standard library only. Fixtures are built in-memory: a synthetic
+30 tests, standard library only. Fixtures are built in-memory: a synthetic
 disk image with one file of each type, a truncated JPEG, an embedded
 thumbnail header, ZIP archive comments, and CLI exit-code checks.

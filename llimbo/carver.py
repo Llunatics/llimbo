@@ -6,15 +6,17 @@ finds a header, then the matching footer:
 
 - JPEG: ``FF D8 FF`` ... ``FF D9``
 - PNG:  ``89 50 4E 47`` ... ``IEND`` + CRC
-- GIF:  ``GIF87a`` / ``GIF89a`` ... ``3B`` trailer byte (heuristic: the
-  first trailer byte after the header; see README for the caveat)
+- GIF:  ``GIF87a`` / ``GIF89a`` ... ``00 3B`` (the trailer byte preceded by
+  the zero-length sub-block terminator; see README for the caveat)
 - PDF:  ``%PDF-`` ... ``%%EOF``
 - ZIP:  ``PK 03 04`` ... end-of-central-directory record ``PK 05 06``
   (the record's comment length is honoured, so trailing comments are kept)
 
 A header with no footer before end-of-input (or before ``--max-size``)
 is still carved and marked ``truncated`` instead of being dropped, so a
-partially overwritten file is never silently lost.
+partially overwritten file is never silently lost. A ZIP whose
+end-of-central-directory record or archive comment is cut short is
+likewise marked ``truncated``.
 """
 
 from __future__ import annotations
@@ -39,7 +41,11 @@ PNG_HEADER = b"\x89PNG\r\n\x1a\n"
 PNG_FOOTER = b"IEND"
 GIF87_HEADER = b"GIF87a"
 GIF89_HEADER = b"GIF89a"
-GIF_FOOTER = b"\x3b"
+# GIF trailer: a valid GIF always ends its last data sub-block with a
+# zero-length terminator (00) before the 3B trailer byte, so the footer
+# is the two-byte pair. A bare 3B appears inside compressed image data
+# far too often (1 in 256 bytes) to be a usable footer on its own.
+GIF_FOOTER = b"\x00\x3b"
 PDF_HEADER = b"%PDF-"
 PDF_FOOTER = b"%%EOF"
 ZIP_HEADER = b"PK\x03\x04"
@@ -104,14 +110,41 @@ class ScanResult:
     bytes_scanned: int = 0
 
 
-def _find_footer(ftype: FileType, data: bytes, start: int, limit: int) -> int | None:
-    """Offset just past the footer, or None if no footer within ``limit``."""
+def _zip_footer_complete(data: bytes, footer_pos: int) -> bool:
+    """True if the EOCD record and its full comment are present.
+
+    A record cut short by end-of-input (fewer than 22 bytes left, or a
+    comment length running past the data) means the archive itself is
+    incomplete, even though the ``PK 05 06`` marker was found.
+    """
+    if len(data) < footer_pos + 22:
+        return False
+    comment_len = int.from_bytes(data[footer_pos + 20:footer_pos + 22], "little")
+    return footer_pos + 22 + comment_len <= len(data)
+
+
+def _find_footer(
+    ftype: FileType, data: bytes, start: int, limit: int
+) -> tuple[int, bool] | None:
+    """(end offset, complete?) for the first footer, or None.
+
+    Returns None when no footer starts within ``limit`` — including when
+    the footer itself is found but the file's tail (PNG CRC, ZIP comment)
+    would run past ``limit``. The caller then cuts the file at ``limit``
+    and marks it ``truncated``, so ``--max-size`` is never exceeded.
+    """
     pos = data.find(ftype.footer, start, limit)
     if pos == -1:
         return None
     if ftype.name == "zip":
-        return _zip_footer_end(data, pos)
-    return min(pos + len(ftype.footer) + ftype.footer_extra, len(data))
+        end = _zip_footer_end(data, pos)
+        complete = _zip_footer_complete(data, pos)
+    else:
+        end = pos + len(ftype.footer) + ftype.footer_extra
+        complete = end <= len(data)
+    if end > limit:
+        return None
+    return end, complete
 
 
 def scan_bytes(
@@ -157,13 +190,13 @@ def scan_bytes(
         limit = len(data)
         if max_size:
             limit = min(limit, offset + max_size)
-        footer_end = _find_footer(ftype, data, offset + 1, limit)
-        if footer_end is None:
+        footer = _find_footer(ftype, data, offset + 1, limit)
+        if footer is None:
             end = limit
             status = "truncated"
         else:
-            end = footer_end
-            status = "complete"
+            end, complete = footer
+            status = "complete" if complete else "truncated"
         size = end - offset
         if size < min_size:
             skipped += 1
@@ -215,8 +248,12 @@ def carve(
 
     Returns the scan result plus the list of written file paths.
     Existing output names get a ``_1``, ``_2`` suffix instead of being
-    overwritten.
+    overwritten. ``prefix`` must be a plain filename (no ``/`` or ``\\``):
+    a prefix containing a separator would write outside ``out_dir``.
     """
+    if "/" in prefix or "\\" in prefix:
+        raise ValueError("prefix must be a plain filename, not a path: "
+                         f"{prefix!r}")
     result = scan_file(path, types=types, min_size=min_size, max_size=max_size)
     os.makedirs(out_dir, exist_ok=True)
     written: list[str] = []
